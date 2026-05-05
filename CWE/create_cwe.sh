@@ -75,7 +75,7 @@ echo "  OUTPUT     : ${OUTPUT_DIR}"
 echo "  SEED       : ${SEED}"
 echo
 
-srun --environment="${SLURM_SUBMIT_DIR}/../container/nemo.toml" bash -c "
+srun --environment="${SLURM_SUBMIT_DIR}/../nemo.toml" bash -c "
     export PYTHONPATH=${MEGATRON_PATH}
     python -u '${SLURM_SUBMIT_DIR}/create_cwe.py' \
         --hard-input '${HARD_INPUT}' \

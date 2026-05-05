@@ -31,7 +31,7 @@ HARD_ROOT="${2:?need HARD_ROOT}"
 EASY_ROOT="${3:?need EASY_ROOT}"
 
 MEGATRON_PATH=/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_fixed
-OUTPUT_BASE=/capstor/scratch/cscs/dtamayomela/synthetic_data/DocOrder/long_context_combined
+OUTPUT_BASE=/capstor/scratch/cscs/dtamayomela/LongContextQA/DocOrder/long_context_combined
 OUTPUT_DIR="${OUTPUT_BASE}/${NAME}"
 
 mkdir -p "${OUTPUT_DIR}" logs
@@ -43,7 +43,7 @@ echo "  easy root : ${EASY_ROOT}"
 echo "  output    : ${OUTPUT_DIR}"
 echo "=========================================================="
 
-srun --environment="${SLURM_SUBMIT_DIR}/../container/nemo.toml" bash -c "\
+srun --environment="${SLURM_SUBMIT_DIR}/../nemo.toml" bash -c "\
     export PYTHONPATH=${MEGATRON_PATH}
     python ${SLURM_SUBMIT_DIR}/create_DocOrder.py \
         --hard-root '${HARD_ROOT}' \

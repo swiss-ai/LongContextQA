@@ -20,7 +20,7 @@ MEGATRON_PATH=/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_f
 echo "Job $SLURM_JOB_ID started at $(date)"
 echo "Output dir: $OUTPUT_DIR"
 
-srun --environment="${SCRIPT_DIR}/nemo.toml" bash -c "\
+srun --environment="${SCRIPT_DIR}/../nemo.toml" bash -c "\
     export PYTHONPATH=${MEGATRON_PATH}
     python -u ${SCRIPT_DIR}/multimodal_composition.py \
         --output-dir $OUTPUT_DIR \
