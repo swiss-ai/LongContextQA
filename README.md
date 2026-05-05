@@ -12,6 +12,7 @@ To improve packing efficiency, each task includes samples spanning a range of se
 CWE
   * Hard: 10 QA pairs
   * Easy: 5 QA pairs
+
 Document ordering
   * Hard: 8 shuffled sections
   * Easy: 4 shuffled sections
