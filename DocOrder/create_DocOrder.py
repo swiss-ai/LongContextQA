@@ -1,580 +1,489 @@
+#!/usr/bin/env python3
 """
-Sample N documents from an MMap indexed dataset, then for each document:
-  1. Detect section boundaries via newline-separator tokens.
-  2. Randomly pick M sections (M drawn uniformly from [min_sections, max_sections])
-     and shuffle them, prepending "The following text is Section j\n" headers.
-  3. Embed the shuffled document INSIDE the user turn of a section-ordering QA
-     chat (formatted with the model's chat template).
- 
-The assistant answer lists the ORIGINAL section indices in the order they should
-appear, e.g. "The correct order of the sections is [3, 1, 2]."
- 
-Output layout (flat):
-    <output_dir>/<source_name>/dump-0/00000_tokens.{idx,bin}
- 
-The final token sequence looks like:
-    <s>
-    <|system_start|>You are a helpful assistant. Be concise.<|system_end|>
-    <|developer_start|>Deliberation: disabled\nTool Capabilities: disabled<|developer_end|>
-    <|user_start|>
-    The sections of this document may appear in a different order than in the
-    original source; please list them in the order in which they should appear.
-    <shuffled document text>
-    <|user_end|>
-    <|assistant_start|>The correct order of the sections is [2, 1, 4, 3].<|assistant_end|>
+DocOrder pipeline for combined easy + hard buckets.
+
+Each output document is a single chat exchange:
+
+    <s><|system_start|>  You are a helpful assistant. Be concise.<|system_end|>
+       <|user_start|>    [Section 1]
+                         ...shuffled section text...
+
+                         [Section 2]
+                         ...shuffled section text...
+                         ...
+                         <question>           <|user_end|>
+       <|assistant_start|> <answer>           <|assistant_end|>
     </s>
- 
+
+There is nothing between <s> and <|system_start|>; the shuffled body
+sits inside the user message, immediately followed by the question.
+
+For every sampled document the script:
+
+    1. Strips its leading <s> / trailing </s>.
+    2. Splits the remaining content tokens into N roughly-equal chunks
+       (N = --easy-sections for docs from the easy root, N = --hard-sections
+       for docs from the hard root).
+    3. Decodes each chunk back to text and randomly permutes them.
+    4. Builds the user message as
+           [Section 1]\\n<text>\\n\\n[Section 2]\\n<text>\\n\\n... \\n\\n<question>
+       where the section labels are 1-indexed by SHUFFLED position.
+    5. Picks one of 10 question phrasings — each one prescribes its own
+       answer format — and renders the correct ordering accordingly.
+    6. Calls tokenizer.apply_chat_template on
+           [system, user(=shuffled_body + question), assistant(=answer)]
+       and writes the resulting token sequence to a new binary.
+
+Two source roots (easy + hard) are processed and their documents are
+multiplexed into the SAME per-dataset builders.
+
+Output layout (per pair):
+
+    <output_dir>/
+        <dataset_name_1>/dump-0/00000_tokens.{idx,bin}
+        <dataset_name_2>/dump-0/00000_tokens.{idx,bin}
+        ...
+
 Usage:
-    python create_dso.py \\
-        --source testing \\
-        --n-docs 10000 \\
-        --output-dir /path/to/output \\
+
+    python create_DocOrder.py \\
+        --hard-root /path/to/mix_8k_16k_cwe/hard \\
+        --easy-root /path/to/mix_16k_32k_cwe/easy \\
+        --output-dir /path/to/32k_cwe \\
+        --hard-sections 8 \\
+        --easy-sections 4 \\
+        --hard-tokens 1000000000 \\
+        --easy-tokens 1000000000 \\
         --seed 42
 """
- 
+
 import argparse
 import logging
 import os
-import sys
 import time
 from pathlib import Path
- 
+
 import numpy as np
 from transformers import AutoTokenizer
- 
-from megatron.core.datasets.indexed_dataset import IndexedDataset, IndexedDatasetBuilder
- 
+
+from megatron.core.datasets.indexed_dataset import (
+    IndexedDataset,
+    IndexedDatasetBuilder,
+)
+
 logger = logging.getLogger(__name__)
- 
- 
-DATASETS = {
-    "Biomed-Enriched_preprocessed":
-        "/capstor/scratch/cscs/dtamayomela/data/tokenized_data/Apertus-70B-2509/Biomed-Enriched_preprocessed",
-    "dolma3_olmocr_science_pdfs-preprocessed":
-        "/capstor/scratch/cscs/dtamayomela/data/tokenized_data/Apertus-70B-2509/dolma3_olmocr_science_pdfs-preprocessed",
-    "institutional-books-1.0-filtered":
-        "/capstor/scratch/cscs/dtamayomela/data/tokenized_data/Apertus-70B-2509/institutional-books-1.0-filtered",
-    "finepdfs-edu-multilingual-preprocessed":
-        "/capstor/scratch/cscs/dtamayomela/data/corrected_data/finepdfs-edu-multilingual-preprocessed/second_half_longcontext",
-    "finepdfs-edu-preprocessed":
-        "/capstor/scratch/cscs/dtamayomela/long_context/sampled_buckets/32k_baseline/finepdfs-edu-preprocessed",
-    "finepdfs-edu-preprocessed-general":
-        "/capstor/scratch/cscs/dtamayomela/data/corrected_data/finepdfs-edu-preprocessed/second_half_longcontext",
-    "finetranslations":
-        "/capstor/scratch/cscs/dtamayomela/data/corrected_data/finetranslations/second_half_longcontext",
-    "swissai-fineweb-2_0_1-quality_10-filterrobots":
-        "/capstor/scratch/cscs/dtamayomela/data/corrected_data/swissai-fineweb-2_0_1-quality_10-filterrobots/second_half_longcontext",
-    "testing":
-        "/capstor/scratch/cscs/dtamayomela/synthetic_data/data_seed_example",
-    "simple_tokenization":
-        "/capstor/scratch/cscs/dtamayomela/data/simple_tokenization/tokenized_output",
-}
- 
+
 TOKENIZER_NAME = "swiss-ai/Apertus-8B-Instruct-2509"
- 
+
+# Token ids that bookend every document in the binary format
 BOS_ID = 1   # <s>
 EOS_ID = 2   # </s>
- 
-  
+
+# Minimum number of source tokens per section. Documents smaller than
+# n_sections * MIN_TOKENS_PER_SECTION are skipped.
+MIN_TOKENS_PER_SECTION = 32
+
+
+# 10 question phrasings. Each tuple is (question_text, answer_formatter).
+# The answer_formatter takes a 1-indexed list of section labels in the
+# order they should appear in the original document and renders it in the
+# format demanded by the question.
+QUESTION_VARIANTS = [
+    (
+        "The sections of the document above have been rearranged. "
+        "Reconstruct the original ordering and respond with the section "
+        "numbers as a comma-separated list (e.g. '3,1,4,2'). Output only "
+        "the list, with no spaces and no extra text.",
+        lambda order: ",".join(str(x) for x in order),
+    ),
+    (
+        "Above you can see a document whose sections appear in the wrong "
+        "order. Provide the correct sequence as section numbers separated "
+        "by single spaces. Reply with only that line.",
+        lambda order: " ".join(str(x) for x in order),
+    ),
+    (
+        "The document above is out of order. Reorder its sections and "
+        "reply with a JSON array of section numbers, e.g. [2,4,1,3]. "
+        "Output only the array.",
+        lambda order: "[" + ",".join(str(x) for x in order) + "]",
+    ),
+    (
+        "Each section of the document above carries a number indicating "
+        "its current position. Tell me the order in which they should be "
+        "read by listing the section numbers separated by ' -> '. No "
+        "explanation.",
+        lambda order: " -> ".join(str(x) for x in order),
+    ),
+    (
+        "The text above presents the document's sections out of order. "
+        "Output the correct sequence as a hyphen-separated string of "
+        "section numbers (for example: 3-1-4-2). Just the string, "
+        "nothing else.",
+        lambda order: "-".join(str(x) for x in order),
+    ),
+    (
+        "Look at the shuffled sections of the document above. Identify "
+        "the proper reading order and answer with the section numbers "
+        "wrapped in parentheses, e.g. (2)(4)(1)(3). No commentary.",
+        lambda order: "".join(f"({x})" for x in order),
+    ),
+    (
+        "The sections shown above appear in a permuted order. Provide "
+        "the correct order as section numbers separated by commas with "
+        "a single space after each comma (e.g. '3, 1, 4, 2'). Reply only "
+        "with the list.",
+        lambda order: ", ".join(str(x) for x in order),
+    ),
+    (
+        "Above is a document whose sections have been scrambled. Restore "
+        "the proper ordering and answer with a pipe-separated sequence "
+        "of section numbers, like '3|1|4|2'. Output only that string.",
+        lambda order: "|".join(str(x) for x in order),
+    ),
+    (
+        "The document's sections are presented out of order above. "
+        "Return the correct sequence of section numbers, one per line, "
+        "with no other characters.",
+        lambda order: "\n".join(str(x) for x in order),
+    ),
+    (
+        "The sections of the document above have been shuffled. Give the "
+        "correct order using the format 'Order: N1, N2, N3, ...' where "
+        "each Nk is a section number. Output that single line only.",
+        lambda order: "Order: " + ", ".join(str(x) for x in order),
+    ),
+]
+
+SYSTEM_PROMPT = "You are a helpful assistant. Be concise."
+
+
 def fmt_tokens(n):
     if n >= 1e9: return f"{n / 1e9:.3f}B"
     if n >= 1e6: return f"{n / 1e6:.1f}M"
     if n >= 1e3: return f"{n / 1e3:.1f}K"
     return str(n)
- 
- 
+
+
 def discover_shard_prefixes(data_dir):
-    """
-    Discover all IndexedDataset shard prefixes under data_dir.
- 
-    Accepted naming conventions (both relative to a dump-* subdirectory):
-      - <name>_tokens.idx   (standard Megatron layout)
-      - <name>.idx          (flat layout, e.g. tokenized_output.idx)
-    """
     root = Path(data_dir)
     prefixes = []
     for dump in sorted(root.glob("dump-*")):
-        if not dump.is_dir():
-            continue
-        seen = set()
-        for idx in sorted(dump.glob("*_tokens.idx")):
-            prefix = str(idx)[:-4]
-            if prefix not in seen:
-                seen.add(prefix)
-                prefixes.append(prefix)
-        for idx in sorted(dump.glob("*.idx")):
-            prefix = str(idx)[:-4]
-            if prefix not in seen:
-                seen.add(prefix)
-                prefixes.append(prefix)
+        if dump.is_dir():
+            for idx in sorted(dump.glob("*_tokens.idx")):
+                prefixes.append(str(idx)[:-4])
     return prefixes
- 
- 
-def sample_doc_indices(shard_prefixes, n_docs, rng):
-    counts = []
-    for prefix in shard_prefixes:
-        if not IndexedDataset.exists(prefix):
-            counts.append(0)
-            continue
-        ds = IndexedDataset(prefix)
-        counts.append(len(ds.document_indices) - 1)
-        del ds
- 
-    total = sum(counts)
-    if total == 0:
-        return []
- 
-    actual_n = min(n_docs, total)
-    if actual_n < n_docs:
-        logger.warning("Only %d docs available (requested %d)", total, n_docs)
- 
-    global_ids = rng.choice(total, size=actual_n, replace=False)
-    global_ids.sort()
- 
-    boundaries = np.concatenate([[0], np.cumsum(counts)])
-    result = []
-    for gid in global_ids:
-        si = int(np.searchsorted(boundaries, gid, side="right")) - 1
-        local_id = int(gid - boundaries[si])
-        result.append((si, local_id))
- 
-    return result
- 
- 
-def build_newline_token_set(tokenizer):
-    """
-    Return a plain Python int set of token ids that correspond to one or more
-    consecutive newline characters (i.e. section separators).
-    """
-    anchor = "hello"
-    sep_token_ids = set()
-    anchor_ids = tokenizer(anchor)["input_ids"]
-    if anchor_ids and anchor_ids[0] == BOS_ID:
-        anchor_ids = anchor_ids[1:]
-    anchor_tok = int(anchor_ids[0])
-    for n in range(1, 9):
-        text = anchor + "\n" * n + anchor
-        ids = tokenizer(text)["input_ids"]
-        body = ids[1:] if (ids and ids[0] == BOS_ID) else ids
-        positions = [i for i, t in enumerate(body) if int(t) == anchor_tok]
-        if len(positions) >= 2:
-            for mid in body[positions[0] + 1: positions[1]]:
-                sep_token_ids.add(int(mid))
-    return sep_token_ids
- 
- 
-def split_into_sections(doc_tokens, sep_token_ids):
-    """
-    Split doc_tokens on any token in sep_token_ids.
- 
-    Returns:
-        sections   – list of np.int64 arrays (content tokens, no separator)
-        separators – list of int token ids (length = len(sections) - 1)
-        leading_bos  – list of ints ([] or [BOS_ID])
-        trailing_eos – list of ints ([] or [EOS_ID])
-    """
-    token_list = [int(t) for t in doc_tokens]
- 
-    leading_bos: list = []
-    trailing_eos: list = []
-    if token_list and token_list[0] == BOS_ID:
-        leading_bos = token_list[:1]
-        token_list = token_list[1:]
-    if token_list and token_list[-1] == EOS_ID:
-        trailing_eos = token_list[-1:]
-        token_list = token_list[:-1]
- 
-    sections: list = []
-    separators: list = []
-    current: list = []
-    for tok in token_list:
-        if tok in sep_token_ids:
-            sections.append(np.array(current, dtype=np.int64))
-            separators.append(tok)
-            current = []
-        else:
-            current.append(tok)
-    sections.append(np.array(current, dtype=np.int64))
- 
-    return sections, separators, leading_bos, trailing_eos
- 
-  
-def section_header_tokens(tokenizer, section_number):
-    """
-    Tokenise "\nThe following text is Section {section_number}:\n" without BOS.
-    """
-    text = f"\nThe following text is Section {section_number}:\n"
-    ids = tokenizer(text, add_special_tokens=False)["input_ids"]
-    return np.array(ids, dtype=np.int64)
- 
-  
-def tokens_to_array(parts):
-    """Flatten a list of (int | list[int] | np.ndarray) into one np.int64 array."""
-    arrays = []
-    for p in parts:
-        if isinstance(p, np.ndarray):
-            if p.size:
-                arrays.append(p.astype(np.int64))
-        elif isinstance(p, list):
-            if p:
-                arrays.append(np.array(p, dtype=np.int64))
-        else:
-            arrays.append(np.array([int(p)], dtype=np.int64))
-    return np.concatenate(arrays) if arrays else np.array([], dtype=np.int64)
- 
- 
-def shuffle_sections(
-    doc_tokens, sep_token_ids, tokenizer, rng,
-    min_sections, max_sections,
-):
-    """
-    Partition the document into M chunks, shuffle them, prepend section headers,
-    and return the reassembled token sequence together with the answer key.
- 
-    CHANGED from original: BOS and EOS are STRIPPED from the returned token
-    array. The caller is responsible for wrapping everything inside the chat
-    template (which provides its own BOS/EOS).
- 
-    Returns:
-        (shuffled_body_tokens, correct_order)
-        shuffled_body_tokens - np.int64 array, NO leading BOS, NO trailing EOS.
-        correct_order        - list of 1-based ints giving the reading order.
-        (None, None)         - if the document has fewer than min_sections sections.
-    """
-    sections, separators, _leading_bos, _trailing_eos = split_into_sections(
-        doc_tokens, sep_token_ids
-    )
-    # NOTE: We intentionally discard leading_bos and trailing_eos here.
-    # The BOS/EOS for the full example will come from apply_chat_template.
- 
-    n_atomic = len(sections)
-    if n_atomic < min_sections:
-        return None, None
- 
-    # Choose M (number of chunks)
-    m = int(rng.integers(min_sections, min(max_sections, n_atomic) + 1))
- 
-    # Choose M-1 cut points from the N-1 inter-section boundaries
-    boundary_count = n_atomic - 1
-    cut_positions = sorted(
-        rng.choice(boundary_count, size=m - 1, replace=False).tolist()
-    )
-    boundaries = [0] + [p + 1 for p in cut_positions] + [n_atomic]
- 
-    # Build chunks
-    chunks = []
-    for k in range(m):
-        lo, hi = boundaries[k], boundaries[k + 1]
-        chunk_parts = []
-        for i in range(lo, hi):
-            chunk_parts.append(sections[i])
-            if i < hi - 1 and i < len(separators):
-                chunk_parts.append(np.array([separators[i]], dtype=np.int64))
-        chunks.append(chunk_parts)
- 
-    # Shuffle chunks (ensure genuine permutation)
-    shuffled_order = list(range(m))
-    for _ in range(100):
-        rng.shuffle(shuffled_order)
-        if shuffled_order != list(range(m)):
-            break
- 
-    display_label_for = [0] * m
-    for display_pos, orig_idx in enumerate(shuffled_order):
-        display_label_for[orig_idx] = display_pos + 1
-    correct_order = [display_label_for[k] for k in range(m)]
- 
-    # Reassemble — NO BOS/EOS; those come from the chat template
-    parts = []
-    for display_pos, orig_idx in enumerate(shuffled_order):
-        label = display_pos + 1
-        parts.append(section_header_tokens(tokenizer, label))
-        parts.extend(chunks[orig_idx])
- 
-    return tokens_to_array(parts), correct_order
 
- 
-def build_full_example_tokens(tokenizer, shuffled_body_tokens, correct_order):
+
+def collect_doc_metadata(shard_prefixes):
     """
-    Build the complete token sequence for one training example.
- 
-    Layout:
-        <s>
-        <|system_start|>You are a helpful assistant. Be concise.<|system_end|>
-        <|developer_start|>Deliberation: disabled
-        Tool Capabilities: disabled<|developer_end|>
-        <|user_start|>
-        The sections of this document may appear in a different order than in
-        the original source; please list them in the order in which they should
-        appear.
-        <shuffled document tokens decoded and re-embedded here>
-        <|user_end|>
-        <|assistant_start|>The correct order of the sections is [2, 1, 4, 3].<|assistant_end|>
-        </s>
- 
-    Strategy
-    --------
-    We decode the shuffled body tokens back to text and embed that text
-    directly inside the user message string before calling
-    `apply_chat_template`.  This avoids fragile manual token-level stitching
-    and lets the tokenizer handle special-token insertion correctly.
- 
-    The decode → re-encode round-trip is safe here because:
-      - The shuffled body was itself built by concatenating tokenizer outputs,
-        so every token id is within vocabulary.
-      - We skip_special_tokens=False so structural tokens (if any) survive,
-        but BOS/EOS were already stripped by shuffle_sections.
- 
-    Args:
-        tokenizer           - HF tokenizer with apply_chat_template support.
-        shuffled_body_tokens - np.int64 array; NO BOS, NO EOS.
-        correct_order       - list of 1-based ints, e.g. [3, 1, 2].
- 
-    Returns:
-        np.int64 array of the complete example token ids (includes BOS/EOS
-        as produced by apply_chat_template).
+    Returns (all_docs, dtype) where all_docs is a list of
+    (shard_idx, doc_id, n_tokens) tuples covering every document in every
+    shard. Token counts are computed from the index, not by loading the
+    sequences themselves.
     """
-    # decode shuffled body back to text 
-    # skip_special_tokens=False: we stripped BOS/EOS already, and we want
-    # any other vocabulary tokens (e.g. separator tokens) to round-trip.
-    shuffled_text = tokenizer.decode(
-        shuffled_body_tokens.tolist(),
-        skip_special_tokens=False,
-        clean_up_tokenization_spaces=False,
-    )
- 
-    # build the answer string 
-    order_str = "[" + ", ".join(str(i) for i in correct_order) + "]"
- 
-    # assemble messages 
-    # The shuffled document is appended to the user message content so it
-    # appears INSIDE the <|user_start|>…<|user_end|> span.
-    user_instruction = (
-        "The sections of this document may appear in a different order "
-        "than in the original source; please list them in the order in "
-        "which they should appear."
-    )
-    messages = [
-        {
-            "role": "system",
-            "content": "You are a helpful assistant. Be concise.",
-        },
-        {
-            "role": "user",
-            # Instruction first, then the document body — both inside the
-            # user turn.  A blank line separates instruction from document.
-            "content": f"{user_instruction}\n{shuffled_text}",
-        },
-        {
-            "role": "assistant",
-            "content": f"The correct order of the sections is {order_str}.",
-        },
+    all_docs = []
+    dtype = None
+    for si, sp in enumerate(shard_prefixes):
+        if not IndexedDataset.exists(sp):
+            continue
+        ds = IndexedDataset(sp)
+        if dtype is None:
+            dtype = ds.index.dtype
+        doc_idx = ds.document_indices
+        seq_lens = ds.sequence_lengths
+        n_docs = len(doc_idx) - 1
+        if n_docs == 0:
+            del ds
+            continue
+        cumsum = np.concatenate([[0], np.cumsum(seq_lens.astype(np.int64))])
+        for did in range(n_docs):
+            n_tokens = int(cumsum[doc_idx[did + 1]] - cumsum[doc_idx[did]])
+            all_docs.append((si, did, n_tokens))
+        del ds
+    return all_docs, dtype
+
+
+def sample_to_token_budget(all_docs, target_tokens, rng):
+    """
+    Shuffle all_docs uniformly and consume entries until the cumulative
+    source-token count meets or exceeds target_tokens. Returns
+    (sampled, total_source_tokens) where sampled is a list of
+    (shard_idx, doc_id) tuples.
+    """
+    if not all_docs:
+        return [], 0
+    indices = np.arange(len(all_docs))
+    rng.shuffle(indices)
+    sampled = []
+    total = 0
+    for i in indices:
+        si, did, n = all_docs[int(i)]
+        sampled.append((si, did))
+        total += n
+        if total >= target_tokens:
+            break
+    return sampled, total
+
+
+def split_into_sections(content_tokens, n_sections):
+    """Split a token list into n_sections roughly-equal contiguous chunks."""
+    L = len(content_tokens)
+    if L < n_sections:
+        return None
+    section_size = L // n_sections
+    chunks = []
+    for i in range(n_sections):
+        start = i * section_size
+        end = (i + 1) * section_size if i < n_sections - 1 else L
+        chunks.append(list(content_tokens[start:end]))
+    return chunks
+
+
+def get_doc_tokens(ds, did):
+    """Concatenate all sequences for document `did` into a single 1-D int64 array."""
+    seq_start = int(ds.document_indices[did])
+    seq_end   = int(ds.document_indices[did + 1])
+    seqs = ds[seq_start:seq_end]
+    if not seqs:
+        return np.array([], dtype=np.int64)
+    return np.concatenate(seqs).astype(np.int64)
+
+
+def process_doc(doc_tokens, n_sections, tokenizer, rng):
+    """
+    Build the new (chat-template-formatted) token sequence for one
+    document. Returns None if the document is too short to be meaningfully
+    split.
+    """
+    tokens = doc_tokens.tolist() if hasattr(doc_tokens, "tolist") else list(doc_tokens)
+    if not tokens:
+        return None
+
+    # Strip leading <s> / trailing </s> from the source document
+    has_bos = tokens[0]  == BOS_ID
+    has_eos = tokens[-1] == EOS_ID
+    content = tokens[1 if has_bos else 0 : (-1 if has_eos else None)]
+
+    if len(content) < n_sections * MIN_TOKENS_PER_SECTION:
+        return None
+
+    sections_tokens = split_into_sections(content, n_sections)
+    if sections_tokens is None:
+        return None
+
+    # Decode each section back to text. skip_special_tokens=True is safe
+    # because we already stripped the document's BOS/EOS; any special
+    # tokens that survived inside the body would be artifacts.
+    section_texts = [
+        tokenizer.decode(s, skip_special_tokens=True)
+        for s in sections_tokens
     ]
- 
-    token_ids = tokenizer.apply_chat_template(
+
+    # Random permutation: perm[shuffled_pos] = original_idx
+    perm = list(range(n_sections))
+    rng.shuffle(perm)
+
+    # correct_order[k] = SHUFFLED-position label (1-indexed) of the
+    # section that originally came k-th. Reading the document in the
+    # order [correct_order[0], correct_order[1], ...] recovers the
+    # original sequence.
+    correct_order = [0] * n_sections
+    for shuffled_pos, original_idx in enumerate(perm):
+        correct_order[original_idx] = shuffled_pos + 1
+
+    # Build the shuffled body as plain text
+    body_parts = []
+    for shuffled_pos, original_idx in enumerate(perm):
+        label = shuffled_pos + 1
+        body_parts.append(f"[Section {label}]\n{section_texts[original_idx]}")
+    shuffled_body = "\n\n".join(body_parts)
+
+    # Pick a question variant and render the answer in its format
+    variant_idx = int(rng.integers(0, len(QUESTION_VARIANTS)))
+    question, answer_fn = QUESTION_VARIANTS[variant_idx]
+    answer_str = answer_fn(correct_order)
+
+    # User turn = shuffled body, blank line, then the question
+    user_content = shuffled_body + "\n\n" + question
+
+    messages = [
+        {"role": "system",    "content": SYSTEM_PROMPT},
+        {"role": "user",      "content": user_content},
+        {"role": "assistant", "content": answer_str},
+    ]
+
+    full_tokens = tokenizer.apply_chat_template(
         messages,
         tokenize=True,
         add_generation_prompt=False,
     )
 
-    if not token_ids or token_ids[-1] != EOS_ID:
-        token_ids = token_ids + [EOS_ID]
-    return np.array(token_ids, dtype=np.int64)
- 
-  
-def process_and_write(
-    shard_prefixes, sampled, tokenizer, sep_token_ids,
-    output_dir, source_name, rng,
-    min_sections, max_sections,
-):
-    prefix = os.path.join(output_dir, source_name, "dump-0", "00000_tokens")
-    os.makedirs(os.path.dirname(prefix), exist_ok=True)
- 
-    dtype = None
-    for sp in shard_prefixes:
-        if IndexedDataset.exists(sp):
-            dtype = IndexedDataset(sp).index.dtype
-            break
-    if dtype is None:
-        raise RuntimeError("No valid shards found")
- 
-    builder = IndexedDatasetBuilder(prefix + ".bin", dtype=dtype)
- 
+    # The Apertus chat template emits <s> at the start and </s> at the
+    # end, but defensively guarantee that boundary so the binary stays
+    # well-formed even if a future template revision drops them.
+    if not full_tokens or full_tokens[0] != BOS_ID:
+        full_tokens = [BOS_ID] + list(full_tokens)
+    if full_tokens[-1] != EOS_ID:
+        full_tokens = list(full_tokens) + [EOS_ID]
+
+    return full_tokens
+
+
+# Per-dataset / per-root drivers
+
+def process_one_dataset(ds_dir, n_sections, target_tokens, output_root,
+                        tokenizer, rng, builders, label):
+    ds_name = ds_dir.name
+    shard_prefixes = discover_shard_prefixes(str(ds_dir))
+    if not shard_prefixes:
+        logger.warning("[%s/%s] no shards found", label, ds_name)
+        return 0, 0
+
+    all_docs, dtype = collect_doc_metadata(shard_prefixes)
+    if not all_docs:
+        logger.warning("[%s/%s] no documents found", label, ds_name)
+        return 0, 0
+
+    sampled, sampled_src_tokens = sample_to_token_budget(all_docs, target_tokens, rng)
+    logger.info(
+        "[%s/%s] sampled %d docs (~%s source tokens, budget %s)",
+        label, ds_name, len(sampled),
+        fmt_tokens(sampled_src_tokens), fmt_tokens(target_tokens),
+    )
+
+    # Lazily create one builder per dataset; keyed by dataset name so that
+    # easy and hard for the same dataset share a builder.
+    if ds_name not in builders:
+        prefix = os.path.join(output_root, ds_name, "dump-0", "00000_tokens")
+        os.makedirs(os.path.dirname(prefix), exist_ok=True)
+        builders[ds_name] = {
+            "prefix":  prefix,
+            "builder": IndexedDatasetBuilder(prefix + ".bin", dtype=dtype),
+            "dtype":   dtype,
+        }
+    info = builders[ds_name]
+    builder, out_dtype = info["builder"], info["dtype"]
+
+    # Group by shard for cheap sequential reads
     by_shard = {}
-    for order_idx, (si, did) in enumerate(sampled):
-        by_shard.setdefault(si, []).append((did, order_idx))
- 
-    total_docs   = 0
-    total_tokens = 0
-    skipped_docs = 0
- 
+    for si, did in sampled:
+        by_shard.setdefault(si, []).append(did)
+
+    n_written = n_skipped = tokens_written = 0
+
     for si in sorted(by_shard):
         sp = shard_prefixes[si]
         if not IndexedDataset.exists(sp):
-            logger.warning("Shard %d missing, skipping", si)
             continue
         ds = IndexedDataset(sp)
-        doc_idx = ds.document_indices
- 
-        entries = sorted(by_shard[si], key=lambda x: x[0])
- 
-        i = 0
-        while i < len(entries):
-            run_start_did = entries[i][0]
-            run_end_did   = run_start_did
-            j = i
-            while j + 1 < len(entries) and entries[j + 1][0] == run_end_did + 1:
-                j += 1
-                run_end_did = entries[j][0]
- 
-            seq_start = int(doc_idx[run_start_did])
-            seq_end   = int(doc_idx[run_end_did + 1])
-            all_seqs  = ds[seq_start:seq_end]
- 
-            for k in range(i, j + 1):
-                did, order_idx = entries[k]
-                lo = int(doc_idx[did])     - seq_start
-                hi = int(doc_idx[did + 1]) - seq_start
-                seqs = all_seqs[lo:hi]
- 
-                doc_tokens = (
-                    np.concatenate(seqs).astype(np.int64)
-                    if seqs else np.array([], dtype=np.int64)
-                )
-                if len(doc_tokens) > 32_768 or len(doc_tokens) < 8_000:
-                    skipped_docs += 1
-                    continue
- 
-                #  shuffle sections (returns body only, no BOS/EOS) 
-                shuffled_body, correct_order = shuffle_sections(
-                    doc_tokens, sep_token_ids, tokenizer, rng,
-                    min_sections, max_sections,
-                )
- 
-                if shuffled_body is None:
-                    logger.warning(
-                        "Too few sections in doc (shard=%d, doc=%d) — skipping.",
-                        si, did,
-                    )
-                    skipped_docs += 1
-                    continue
- 
-                # --- build full example: document embedded inside user turn --
-                # CHANGED: replaces the old two-step (prepend shuffled tokens,
-                # then append chat tokens).  Now the shuffled text is decoded
-                # and placed inside the user message before apply_chat_template
-                # is called, so the final sequence is:
-                #
-                #   BOS  system  developer  user[instruction + doc]  assistant  EOS
-                #
-                new_tokens = build_full_example_tokens(
-                    tokenizer, shuffled_body, correct_order
-                )
- 
-                new_tokens_typed = new_tokens.astype(dtype)
-                builder.add_document(new_tokens_typed, [len(new_tokens_typed)])
-                total_docs   += 1
-                total_tokens += len(new_tokens_typed)
- 
-            i = j + 1
+        for did in sorted(by_shard[si]):
+            doc_tokens = get_doc_tokens(ds, did)
+            new_tokens = process_doc(doc_tokens, n_sections, tokenizer, rng)
+            if new_tokens is None:
+                n_skipped += 1
+                continue
+            arr = np.array(new_tokens, dtype=out_dtype)
+            builder.add_document(arr, [len(arr)])
+            n_written      += 1
+            tokens_written += len(arr)
         del ds
- 
-    builder.finalize(prefix + ".idx")
+
     logger.info(
-        "Wrote %d docs, %s tokens → %s  (%d skipped — too few sections)",
-        total_docs, fmt_tokens(total_tokens), prefix, skipped_docs,
+        "[%s/%s] wrote %d docs / %s tokens (%d skipped — too short)",
+        label, ds_name, n_written, fmt_tokens(tokens_written), n_skipped,
     )
- 
- 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
- 
+    return n_written, tokens_written
+
+
+def process_root(root_dir, n_sections, target_tokens, output_root,
+                 tokenizer, rng, builders, label):
+    dataset_dirs = sorted(d for d in Path(root_dir).iterdir() if d.is_dir())
+    if not dataset_dirs:
+        logger.warning("[%s] no dataset subdirs in %s", label, root_dir)
+        return 0, 0
+    per_ds_budget = target_tokens // len(dataset_dirs)
+    logger.info(
+        "[%s] %d datasets under %s — per-dataset budget %s",
+        label, len(dataset_dirs), root_dir, fmt_tokens(per_ds_budget),
+    )
+    total_docs = total_tokens = 0
+    for ds_dir in dataset_dirs:
+        d, t = process_one_dataset(
+            ds_dir, n_sections, per_ds_budget, output_root,
+            tokenizer, rng, builders, label,
+        )
+        total_docs   += d
+        total_tokens += t
+    return total_docs, total_tokens
+
+
 def main():
     ap = argparse.ArgumentParser(
-        description="Sample N docs, shuffle sections, embed doc in user turn, write new binary."
+        description="Apply the DocOrder task to combined easy + hard buckets.",
     )
-    ap.add_argument(
-        "--source", required=True, choices=list(DATASETS.keys()),
-        help="Source dataset name.",
-    )
-    ap.add_argument(
-        "--n-docs", type=int, default=10_000,
-        help="Number of documents to sample (default: 10 000).",
-    )
-    ap.add_argument(
-        "--output-dir", required=True,
-        help="Root directory for output binaries.",
-    )
-    ap.add_argument(
-        "--seed", type=int, default=42,
-        help="Random seed (default: 42).",
-    )
-    ap.add_argument(
-        "--min-sections", type=int, default=2,
-        help="Minimum sections required and minimum M for shuffle (default: 2).",
-    )
-    ap.add_argument(
-        "--max-sections", type=int, default=6,
-        help="Maximum M sections to include in each shuffle task (default: 6).",
-    )
-    ap.add_argument(
-        "--dry-run", action="store_true",
-        help="Run phase 1 only (sampling), print stats, then stop.",
-    )
+    ap.add_argument("--easy-root", required=True,
+                    help="Easy bucket root (contains one subdir per source dataset).")
+    ap.add_argument("--hard-root", required=True,
+                    help="Hard bucket root (contains one subdir per source dataset).")
+    ap.add_argument("--output-dir", required=True,
+                    help="Output root: one subdir per dataset, each with dump-0/.")
+    ap.add_argument("--easy-sections", type=int, default=4)
+    ap.add_argument("--hard-sections", type=int, default=8)
+    ap.add_argument("--easy-tokens", type=int, default=1_000_000_000,
+                    help="Source-token budget across all easy datasets (default 1B).")
+    ap.add_argument("--hard-tokens", type=int, default=1_000_000_000,
+                    help="Source-token budget across all hard datasets (default 1B).")
+    ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
- 
-    if args.min_sections < 2:
-        ap.error("--min-sections must be at least 2")
-    if args.max_sections < args.min_sections:
-        ap.error("--max-sections must be >= --min-sections")
- 
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%H:%M:%S",
     )
- 
-    data_dir   = DATASETS[args.source]
+
     output_dir = str(Path(args.output_dir).resolve())
     os.makedirs(output_dir, exist_ok=True)
- 
+
     rng = np.random.default_rng(args.seed)
- 
-    logger.info("Phase 1: discovering shards in %s …", data_dir)
-    t0 = time.perf_counter()
- 
-    shard_prefixes = discover_shard_prefixes(data_dir)
-    if not shard_prefixes:
-        logger.error("No shards found under %s", data_dir)
-        sys.exit(1)
-    logger.info("  Found %d shards", len(shard_prefixes))
- 
-    sampled = sample_doc_indices(shard_prefixes, args.n_docs, rng)
-    logger.info("  Sampled %d documents (%.1fs)", len(sampled), time.perf_counter() - t0)
- 
-    if args.dry_run:
-        logger.info("Dry run — stopping before decode/write phase.")
-        return
- 
-    logger.info("Phase 2: loading tokenizer and detecting separator tokens …")
+
+    logger.info("Loading tokenizer %s …", TOKENIZER_NAME)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
-    sep_token_ids = build_newline_token_set(tokenizer)
-    logger.info("  Separator token ids: %s", sorted(sep_token_ids))
- 
-    logger.info("Phase 2: shuffling sections, injecting chats, writing …")
-    t2 = time.perf_counter()
- 
-    process_and_write(
-        shard_prefixes, sampled, tokenizer, sep_token_ids,
-        output_dir, args.source, rng,
-        min_sections=args.min_sections,
-        max_sections=args.max_sections,
+
+    builders = {}
+    t0 = time.perf_counter()
+
+    logger.info(
+        "=== HARD root %s | n_sections=%d | budget=%s ===",
+        args.hard_root, args.hard_sections, fmt_tokens(args.hard_tokens),
     )
- 
-    logger.info("Phase 2 done in %.1fs", time.perf_counter() - t2)
-    logger.info("All done.")
- 
- 
+    h_docs, h_tokens = process_root(
+        args.hard_root, args.hard_sections, args.hard_tokens, output_dir,
+        tokenizer, rng, builders, label="hard",
+    )
+    logger.info("HARD total: %d docs / %s tokens", h_docs, fmt_tokens(h_tokens))
+
+    logger.info(
+        "=== EASY root %s | n_sections=%d | budget=%s ===",
+        args.easy_root, args.easy_sections, fmt_tokens(args.easy_tokens),
+    )
+    e_docs, e_tokens = process_root(
+        args.easy_root, args.easy_sections, args.easy_tokens, output_dir,
+        tokenizer, rng, builders, label="easy",
+    )
+    logger.info("EASY total: %d docs / %s tokens", e_docs, fmt_tokens(e_tokens))
+
+    for name, info in builders.items():
+        info["builder"].finalize(info["prefix"] + ".idx")
+        logger.info("finalized %s.{bin,idx}", info["prefix"])
+
+    logger.info(
+        "ALL DONE — wrote %d docs / %s tokens in %.1fs → %s",
+        h_docs + e_docs, fmt_tokens(h_tokens + e_tokens),
+        time.perf_counter() - t0, output_dir,
+    )
+
+
 if __name__ == "__main__":
     main()
