@@ -8,7 +8,6 @@
 #SBATCH --mem=450G
 #SBATCH --time=12:00:00
 #SBATCH --account=infra01
-#SBATCH --reservation=SD-69241-apertus-1-5
 #SBATCH --array=0-3
 
 # Multi-turn CWE: combine each (hard_smaller, easy_larger) pair into  #
@@ -26,6 +25,15 @@
 
 set -euo pipefail
 mkdir -p logs
+
+TMP_REPO="/capstor/scratch/cscs/$USER/.tmp_pipeline_${SLURM_JOB_ID}"
+trap 'rm -rf "$TMP_REPO"' EXIT
+
+git clone --depth 1 \
+    git@github.com:swiss-ai/Megatron-LM.git \
+    "${TMP_REPO}/Megatron-LM"
+
+MEGATRON_PATH="${TMP_REPO}/Megatron-LM"
 
 ROOT=/capstor/scratch/cscs/dtamayomela/long_context/multimodal_composition_3
 
@@ -65,9 +73,6 @@ SEED="${SEEDS[$idx]}"
 
 OUTPUT_DIR="/capstor/scratch/cscs/dtamayomela/LongContextQA/CWE/data/${OUT_NAME}"
 
-SCRIPT_DIR=/capstor/scratch/cscs/dtamayomela/LongContextQA/CWE
-MEGATRON_PATH=/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_fixed
-
 echo "[$(date)] === Task ${idx} : ${OUT_NAME} ==="
 echo "  HARD input : ${HARD_INPUT}"
 echo "  EASY input : ${EASY_INPUT}"
@@ -75,18 +80,19 @@ echo "  OUTPUT     : ${OUTPUT_DIR}"
 echo "  SEED       : ${SEED}"
 echo
 
-srun --environment="${SLURM_SUBMIT_DIR}/../nemo.toml" bash -c "
-    export PYTHONPATH=${MEGATRON_PATH}
+srun --environment="${SLURM_SUBMIT_DIR}/../nemo.toml" bash -c "\
+    cd '${MEGATRON_PATH}' && \
+    python setup.py build_ext --inplace && \
+    export PYTHONPATH='${MEGATRON_PATH}' && \
     python -u '${SLURM_SUBMIT_DIR}/create_cwe.py' \
-        --hard-input '${HARD_INPUT}' \
-        --easy-input '${EASY_INPUT}' \
-        --output-dir '${OUTPUT_DIR}' \
+        --hard-input  '${HARD_INPUT}' \
+        --easy-input  '${EASY_INPUT}' \
+        --output-dir  '${OUTPUT_DIR}' \
         --hard-questions 10 \
         --easy-questions 5 \
         --top-k 15 \
         --min-word-len 4 \
-        --seed ${SEED}
-"
+        --seed ${SEED}"
 
 echo
 echo "[$(date)] === Task ${idx} done ==="
