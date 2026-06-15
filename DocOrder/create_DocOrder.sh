@@ -8,7 +8,6 @@
 #SBATCH --mem=450G
 #SBATCH --time=10:00:00
 #SBATCH --account=infra01
-#SBATCH --reservation=SD-69241-apertus-1-5
 
 # -----------------------------------------------------------------------------
 # Run create_DocOrder.py for ONE pair of (hard, easy) source roots.
@@ -30,8 +29,16 @@ NAME="${1:?need NAME (e.g. 32k_cwe)}"
 HARD_ROOT="${2:?need HARD_ROOT}"
 EASY_ROOT="${3:?need EASY_ROOT}"
 
-MEGATRON_PATH=/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_fixed
-OUTPUT_BASE=/capstor/scratch/cscs/dtamayomela/LongContextQA/DocOrder/long_context_combined
+TMP_REPO="/capstor/scratch/cscs/$USER/.tmp_pipeline_${SLURM_JOB_ID}"
+trap 'rm -rf "$TMP_REPO"' EXIT
+
+git clone --depth 1 \
+    git@github.com:swiss-ai/Megatron-LM.git \
+    "${TMP_REPO}/Megatron-LM"
+
+MEGATRON_PATH="${TMP_REPO}/Megatron-LM"
+
+OUTPUT_BASE=/capstor/scratch/cscs/dtamayomela/LongContextQA/DocOrder/output_data
 OUTPUT_DIR="${OUTPUT_BASE}/${NAME}"
 
 mkdir -p "${OUTPUT_DIR}" logs
@@ -44,10 +51,12 @@ echo "  output    : ${OUTPUT_DIR}"
 echo "=========================================================="
 
 srun --environment="${SLURM_SUBMIT_DIR}/../nemo.toml" bash -c "\
-    export PYTHONPATH=${MEGATRON_PATH}
-    python ${SLURM_SUBMIT_DIR}/create_DocOrder.py \
-        --hard-root '${HARD_ROOT}' \
-        --easy-root '${EASY_ROOT}' \
+    cd '${MEGATRON_PATH}' && \
+    python setup.py build_ext --inplace && \
+    export PYTHONPATH='${MEGATRON_PATH}' && \
+    python -u '${SLURM_SUBMIT_DIR}/create_DocOrder.py' \
+        --hard-root  '${HARD_ROOT}' \
+        --easy-root  '${EASY_ROOT}' \
         --output-dir '${OUTPUT_DIR}' \
         --hard-sections 8 \
         --easy-sections 4 \
