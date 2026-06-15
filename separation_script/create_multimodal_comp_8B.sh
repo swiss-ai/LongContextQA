@@ -12,19 +12,28 @@
 
 set -euo pipefail
 mkdir -p logs
- 
+
 SCRIPT_DIR="$SLURM_SUBMIT_DIR"
 OUTPUT_DIR="${SLURM_SUBMIT_DIR}/multimodal_composition"
-MEGATRON_PATH=/capstor/scratch/cscs/dtamayomela/megatron/pre-training/megatron_fixed
+
+TMP_REPO="/capstor/scratch/cscs/$USER/.tmp_pipeline_${SLURM_JOB_ID}"
+trap 'rm -rf "$TMP_REPO"' EXIT
+
+git clone --depth 1 \
+    git@github.com:swiss-ai/Megatron-LM.git \
+    "${TMP_REPO}/Megatron-LM"
+
+MEGATRON_PATH="${TMP_REPO}/Megatron-LM"
 
 echo "Job $SLURM_JOB_ID started at $(date)"
 echo "Output dir: $OUTPUT_DIR"
 
 srun --environment="${SCRIPT_DIR}/../nemo.toml" bash -c "\
-    export PYTHONPATH=${MEGATRON_PATH}
-    python -u ${SCRIPT_DIR}/multimodal_composition.py \
-        --output-dir $OUTPUT_DIR \
+    cd '${MEGATRON_PATH}' && \
+    python setup.py build_ext --inplace && \
+    export PYTHONPATH='${MEGATRON_PATH}' && \
+    python -u '${SCRIPT_DIR}/multimodal_composition.py' \
+        --output-dir '${OUTPUT_DIR}' \
         --seed 42"
- 
+
 echo "Job finished at $(date)"
- 
