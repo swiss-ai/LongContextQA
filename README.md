@@ -30,12 +30,3 @@ We first need to separate the available data into 3:
 The 3B-token subset is used as the seed corpus for the synthetic tasks: CWE (3B tokens) and Document Ordering (2B tokens, reused with masking and shuffling). An additional 1B tokens are incorporated to further enrich the training mixture.
 
 Firstly, you'll need to execute the bash script of `separation_script` and then the rest of the scripts accordingly.
-
-## Future Work
-
-- [MRCR data](https://arxiv.org/pdf/2409.12640v2). Not added for now given that it will require only training on the last turn (not supported in megatron-sft).
-- Need for full document attention: Current planning explained [here](https://github.com/swiss-ai/apertus-program/issues/41).
-
-## Warnings
-
-- This repository is under development, the scripts also use Megatron-LM indexed dataset outputs given that I am mainly interested in pre-training for now, adapting the code to post training would require some time.
